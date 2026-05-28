@@ -14,6 +14,7 @@ const terminfo = @import("../terminfo/main.zig");
 const posix = std.posix;
 
 const log = std.log.scoped(.io_handler);
+const max_tmux_control_pane_output_bytes: usize = 65_536;
 
 /// This is used as the handler for the terminal.Stream type. This is
 /// stateful and is expected to live for the entire lifetime of the terminal.
@@ -401,6 +402,9 @@ pub const StreamHandler = struct {
                         viewer.* = try .init(self.alloc);
                         errdefer viewer.deinit();
                         self.tmux_viewer = viewer;
+                        self.surfaceMessageWriter(.{
+                            .tmux_control = .{ .event = .enter },
+                        });
                         break :tmux;
                     },
 
@@ -410,6 +414,10 @@ pub const StreamHandler = struct {
                             viewer.deinit();
                             self.alloc.destroy(viewer);
                             self.tmux_viewer = null;
+
+                            self.surfaceMessageWriter(.{
+                                .tmux_control = .{ .event = .exit },
+                            });
                         }
 
                         // And always break since we assert below
@@ -435,13 +443,22 @@ pub const StreamHandler = struct {
                 };
 
                 for (viewer.next(.{ .tmux = tmux })) |action| {
-                    log.info("tmux viewer action={f}", .{action});
+                    switch (action) {
+                        .pane_output => {},
+                        else => log.info("tmux viewer action={f}", .{action}),
+                    }
                     switch (action) {
                         .exit => {
-                            // We ignore this because we will fully exit when
-                            // our DCS connection ends. We may want to handle
-                            // this in the future to notify our GUI we're
-                            // disconnected though.
+                            if (self.tmux_viewer) |viewer_to_close| {
+                                viewer_to_close.deinit();
+                                self.alloc.destroy(viewer_to_close);
+                                self.tmux_viewer = null;
+                            }
+
+                            self.surfaceMessageWriter(.{
+                                .tmux_control = .{ .event = .exit },
+                            });
+                            break :tmux;
                         },
 
                         .command => |command| {
@@ -453,8 +470,52 @@ pub const StreamHandler = struct {
                             ));
                         },
 
-                        .windows => {
-                            // TODO
+                        .windows => |windows| {
+                            const json = serializeTmuxWindows(
+                                self.alloc,
+                                viewer,
+                                windows,
+                            ) catch |err| {
+                                log.warn("failed to serialize tmux windows: {}", .{err});
+                                continue;
+                            };
+                            defer self.alloc.free(json);
+
+                            self.surfaceMessageWriter(.{
+                                .tmux_control = .{
+                                    .event = .windows_changed,
+                                    .data = try apprt.surface.Message.WriteReq.init(
+                                        self.alloc,
+                                        json,
+                                    ),
+                                },
+                            });
+                        },
+
+                        .pane_output => |out| {
+                            const pane_id = std.math.cast(u32, out.pane_id) orelse {
+                                log.warn("tmux pane id={} overflows u32, skipping", .{out.pane_id});
+                                continue;
+                            };
+                            const data = tmuxControlPaneOutputPayload(out.data);
+                            if (data.len != out.data.len) {
+                                log.debug("tmux pane output truncated pane_id={} bytes={} capped_bytes={}", .{
+                                    out.pane_id,
+                                    out.data.len,
+                                    data.len,
+                                });
+                            }
+
+                            self.surfaceMessageWriter(.{
+                                .tmux_control = .{
+                                    .event = .pane_output,
+                                    .id = pane_id,
+                                    .data = try apprt.surface.Message.WriteReq.init(
+                                        self.alloc,
+                                        data,
+                                    ),
+                                },
+                            });
                         },
                     }
                 }
@@ -1554,3 +1615,69 @@ pub const StreamHandler = struct {
         self.surfaceMessageWriter(.{ .progress_report = report });
     }
 };
+
+/// Serialize tmux Viewer window topology to JSON for embedded runtimes.
+fn serializeTmuxWindows(
+    alloc: Allocator,
+    viewer: *const terminal.tmux.Viewer,
+    windows: []const terminal.tmux.Viewer.Window,
+) (Allocator.Error || std.Io.Writer.Error)![]const u8 {
+    var buf: std.Io.Writer.Allocating = .init(alloc);
+    errdefer buf.deinit();
+
+    var jw: std.json.Stringify = .{ .writer = &buf.writer };
+    try jw.beginObject();
+
+    try jw.objectField("session_id");
+    try jw.write(viewer.session_id);
+
+    try jw.objectField("tmux_version");
+    try jw.write(viewer.tmux_version);
+
+    try jw.objectField("pane_ids");
+    try jw.beginArray();
+    for (viewer.panes.keys()) |pane_id| try jw.write(pane_id);
+    try jw.endArray();
+
+    try jw.objectField("windows");
+    try jw.beginArray();
+    for (windows) |window| {
+        try jw.beginObject();
+        try jw.objectField("id");
+        try jw.write(window.id);
+        try jw.objectField("width");
+        try jw.write(window.width);
+        try jw.objectField("height");
+        try jw.write(window.height);
+        try jw.objectField("layout");
+        try window.layout.jsonStringify(&jw);
+        try jw.endObject();
+    }
+    try jw.endArray();
+
+    try jw.endObject();
+    return try buf.toOwnedSlice();
+}
+
+fn tmuxControlPaneOutputPayload(data: []const u8) []const u8 {
+    if (data.len <= max_tmux_control_pane_output_bytes) return data;
+    return data[data.len - max_tmux_control_pane_output_bytes ..];
+}
+
+test "tmux control pane output payload keeps bounded suffix" {
+    const small = "0123456789";
+    try std.testing.expectEqualStrings(small, tmuxControlPaneOutputPayload(small));
+
+    var large: [max_tmux_control_pane_output_bytes + 3]u8 = undefined;
+    @memset(large[0..], 'a');
+    large[0] = 'x';
+    large[1] = 'y';
+    large[2] = 'z';
+    large[large.len - 1] = '!';
+
+    const capped = tmuxControlPaneOutputPayload(large[0..]);
+    try std.testing.expectEqual(@as(usize, max_tmux_control_pane_output_bytes), capped.len);
+    try std.testing.expectEqual(@as(u8, 'a'), capped[0]);
+    try std.testing.expectEqual(@as(u8, '!'), capped[capped.len - 1]);
+    try std.testing.expect(!std.mem.containsAtLeast(u8, capped, 1, "xyz"));
+}

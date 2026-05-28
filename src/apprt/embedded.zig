@@ -78,6 +78,15 @@ pub const App = struct {
 
         /// Close the current surface given by this function.
         close_surface: ?*const fn (SurfaceUD, bool) callconv(.c) void = null,
+
+        /// Report read-only tmux control-mode state for the surface.
+        tmux_control: ?*const fn (
+            SurfaceUD,
+            apprt.surface.Message.TmuxControlMsg.Event,
+            u32,
+            [*]const u8,
+            usize,
+        ) callconv(.c) void = null,
     };
 
     /// This is the key event sent for ghostty_surface_key and
@@ -671,6 +680,16 @@ pub const Surface = struct {
         };
 
         func(self.userdata, process_alive);
+    }
+
+    pub fn tmuxControl(
+        self: *const Surface,
+        event: apprt.surface.Message.TmuxControlMsg.Event,
+        id: u32,
+        data: []const u8,
+    ) void {
+        const func = self.app.opts.tmux_control orelse return;
+        func(self.userdata, event, id, data.ptr, data.len);
     }
 
     pub fn getContentScale(self: *const Surface) !apprt.ContentScale {

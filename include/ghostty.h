@@ -886,6 +886,14 @@ typedef struct {
   ssize_t selected;
 } ghostty_action_search_selected_s;
 
+// apprt.surface.Message.TmuxControlMsg.Event
+typedef enum {
+  GHOSTTY_TMUX_ENTER,
+  GHOSTTY_TMUX_EXIT,
+  GHOSTTY_TMUX_WINDOWS_CHANGED,
+  GHOSTTY_TMUX_PANE_OUTPUT,
+} ghostty_tmux_event_e;
+
 // terminal.Scrollbar
 typedef struct {
   uint64_t total;
@@ -1026,6 +1034,11 @@ typedef void (*ghostty_runtime_close_surface_cb)(void*, bool);
 typedef bool (*ghostty_runtime_action_cb)(ghostty_app_t,
                                           ghostty_target_s,
                                           ghostty_action_s);
+typedef void (*ghostty_runtime_tmux_control_cb)(void*,
+                                                ghostty_tmux_event_e,
+                                                uint32_t,
+                                                const uint8_t*,
+                                                uintptr_t);
 
 typedef struct {
   void* userdata;
@@ -1036,6 +1049,7 @@ typedef struct {
   ghostty_runtime_confirm_read_clipboard_cb confirm_read_clipboard_cb;
   ghostty_runtime_write_clipboard_cb write_clipboard_cb;
   ghostty_runtime_close_surface_cb close_surface_cb;
+  ghostty_runtime_tmux_control_cb tmux_control_cb;
 } ghostty_runtime_config_s;
 
 // apprt.ipc.Target.Key

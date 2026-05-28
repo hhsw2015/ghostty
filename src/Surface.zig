@@ -1154,6 +1154,18 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
             };
         },
 
+        .tmux_control => |v| {
+            defer v.data.deinit();
+            if (comptime @hasDecl(apprt.runtime.Surface, "tmuxControl")) {
+                self.rt_surface.tmuxControl(v.event, v.id, v.data.slice());
+            } else {
+                log.debug(
+                    "apprt ignored tmux control event={s} id={} data_len={}",
+                    .{ @tagName(v.event), v.id, v.data.slice().len },
+                );
+            }
+        },
+
         .selection_scroll_tick => |active| {
             self.selection_scroll_active = active;
             try self.selectionScrollTick();
@@ -5598,6 +5610,11 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             v,
         ),
 
+        .write_active_file => |v| try self.writeScreenFile(
+            .active,
+            v,
+        ),
+
         .new_tab => return try self.rt_app.performAction(
             .{ .surface = self },
             .new_tab,
@@ -5982,6 +5999,9 @@ const WriteScreenLoc = enum {
     screen, // Full screen
     history, // History (scrollback)
     selection, // Selected text
+    active, // Just the active area (no history). Used by the cmux mobile
+            // snapshot path to emit ANSI-styled rows that line up with the
+            // POINT_ACTIVE plain text the iOS render compares against.
 };
 
 fn writeScreenFile(
@@ -6055,6 +6075,15 @@ fn writeScreenFile(
                 );
             },
 
+            .active => active: {
+                break :active terminal.Selection.init(
+                    pages.getTopLeft(.active),
+                    pages.getBottomRight(.active) orelse
+                        break :active null,
+                    false,
+                );
+            },
+
             .selection => self.io.terminal.screens.active.selection,
         };
 
@@ -6071,7 +6100,12 @@ fn writeScreenFile(
                 .vt => .vt,
                 .html => .html,
             },
-            .unwrap = true,
+            // .active must preserve row boundaries so downstream consumers
+            // (cmux's mobile snapshot path) can map row index -> cursor.row.
+            // For .screen / .history / .selection we keep the historical
+            // unwrap=true behavior so existing "copy screen to file" actions
+            // still produce reflowed text suitable for paste.
+            .unwrap = loc != .active,
             .trim = false,
             .background = self.io.terminal.colors.background.get(),
             .foreground = self.io.terminal.colors.foreground.get(),
