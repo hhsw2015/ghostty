@@ -1704,6 +1704,29 @@ pub const CAPI = struct {
         };
     }
 
+    /// Select inclusive absolute screen rows without writing clipboards
+    /// (cmux-specific).
+    export fn ghostty_surface_select_screen_rows(
+        surface: *Surface,
+        top_y: u32,
+        bottom_y: u32,
+    ) bool {
+        return surface.core_surface.selectScreenRows(top_y, bottom_y) catch |err| {
+            log.warn("error selecting screen rows err={}", .{err});
+            return false;
+        };
+    }
+
+    /// Query the active tracked selection as inclusive absolute screen rows
+    /// (cmux-specific).
+    export fn ghostty_surface_selection_screen_rows(
+        surface: *Surface,
+        top_y: *u32,
+        bottom_y: *u32,
+    ) bool {
+        return surface.core_surface.selectionScreenRows(top_y, bottom_y);
+    }
+
     /// Same as ghostty_surface_read_text but reads from the user selection,
     /// if any.
     export fn ghostty_surface_read_selection(
@@ -1741,6 +1764,35 @@ pub const CAPI = struct {
         return readTextLocked(surface, core_sel, result);
     }
 
+    /// cmux fork: read clipboard-formatted plain text from inclusive absolute
+    /// screen rows without mutating the active selection.
+    export fn ghostty_surface_read_screen_clipboard_text(
+        surface: *Surface,
+        top_y: u32,
+        bottom_y: u32,
+        max_bytes: usize,
+        result: *Text,
+    ) bool {
+        surface.core_surface.renderer_state.mutex.lock();
+        defer surface.core_surface.renderer_state.mutex.unlock();
+
+        if (top_y > bottom_y) return false;
+
+        const screen = surface.core_surface.renderer_state.terminal.screens.active;
+        const pages = &screen.pages;
+        if (pages.cols == 0) return false;
+
+        const top_left = pages.pin(.{
+            .screen = .{ .x = 0, .y = top_y },
+        }) orelse return false;
+        const bottom_right = pages.pin(.{
+            .screen = .{ .x = pages.cols -| 1, .y = bottom_y },
+        }) orelse return false;
+        const core_sel = terminal.Selection.init(top_left, bottom_right, false);
+
+        return readClipboardTextLocked(surface, core_sel, max_bytes, result);
+    }
+
     fn readTextLocked(
         surface: *Surface,
         core_sel: terminal.Selection,
@@ -1771,6 +1823,57 @@ pub const CAPI = struct {
             .offset_len = vp.offset_len,
             .text = text.text.ptr,
             .text_len = text.text.len,
+        };
+
+        return true;
+    }
+
+    fn readClipboardTextLocked(
+        surface: *Surface,
+        core_sel: terminal.Selection,
+        max_bytes: usize,
+        result: *Text,
+    ) bool {
+        const core_surface = &surface.core_surface;
+        const opts: terminal.formatter.Options = .{
+            .emit = .plain,
+            .unwrap = true,
+            .trim = core_surface.config.clipboard_trim_trailing_spaces,
+            .codepoint_map = core_surface.config.clipboard_codepoint_map.map.list,
+            .background = core_surface.io.terminal.colors.background.get(),
+            .foreground = core_surface.io.terminal.colors.foreground.get(),
+            .palette = &core_surface.io.terminal.colors.palette.current,
+        };
+
+        var formatter: terminal.formatter.ScreenFormatter = .init(
+            core_surface.io.terminal.screens.active,
+            opts,
+        );
+        formatter.content = .{ .selection = core_sel };
+
+        const scratch = global.alloc.alloc(u8, max_bytes) catch |err| {
+            log.warn("error allocating bounded clipboard text buffer err={}", .{err});
+            return false;
+        };
+        defer global.alloc.free(scratch);
+
+        var writer = std.Io.Writer.fixed(scratch);
+        formatter.format(&writer) catch |err| {
+            log.warn("error formatting clipboard text err={}", .{err});
+            return false;
+        };
+        const formatted = global.alloc.dupeZ(u8, writer.buffered()) catch |err| {
+            log.warn("error allocating clipboard text err={}", .{err});
+            return false;
+        };
+
+        result.* = .{
+            .tl_px_x = -1,
+            .tl_px_y = -1,
+            .offset_start = 0,
+            .offset_len = 0,
+            .text = formatted.ptr,
+            .text_len = formatted.len,
         };
 
         return true;
